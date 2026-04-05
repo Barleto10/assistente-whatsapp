@@ -8,44 +8,29 @@ app.use(express.json());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "meu_token_secreto";
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_ID = process.env.PHONE_ID;
+const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+const ZAPI_URL = `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}`;
 
 // Armazena contexto do PDF por número de telefone
 const userContext = {};
 
-// Webhook de verificação do Meta
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verificado!");
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
+// Rota de health check
+app.get("/", (req, res) => res.send("Assistente WhatsApp Z-API online!"));
 
-// Recebe mensagens do WhatsApp
+// Webhook Z-API
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
-    const entry = req.body?.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const messages = value?.messages;
-    if (!messages?.length) return;
+    const body = req.body;
+    if (!body || body.fromMe) return;
 
-    const msg = messages[0];
-    const from = msg.from;
-    const type = msg.type;
+    const from = body.phone;
+    const type = body.type;
 
-    if (type === "text") {
-      const text = msg.text.body;
+    if (type === "TEXT") {
+      const text = body.text?.message || "";
 
-      // Comando para limpar contexto
       if (text.toLowerCase() === "limpar") {
         delete userContext[from];
         await sendMessage(from, "🗑️ Contexto limpo! Envie um PDF para começar.");
@@ -61,9 +46,9 @@ app.post("/webhook", async (req, res) => {
       const resposta = await consultarClaude(from, text);
       await sendMessage(from, resposta);
 
-    } else if (type === "document") {
-      const docId = msg.document.id;
-      const mime = msg.document.mime_type;
+    } else if (type === "DOCUMENT") {
+      const docUrl = body.document?.documentUrl;
+      const mime = body.document?.mimeType;
 
       if (mime !== "application/pdf") {
         await sendMessage(from, "⚠️ Por favor, envie apenas arquivos PDF.");
@@ -73,16 +58,12 @@ app.post("/webhook", async (req, res) => {
       await sendMessage(from, "📄 PDF recebido! Processando... aguarde um momento.");
 
       try {
-        // Baixa o PDF do WhatsApp
-        const mediaUrl = await getMediaUrl(docId);
-        const pdfBuffer = await downloadMedia(mediaUrl);
-
-        // Extrai texto do PDF
+        const response = await axios.get(docUrl, { responseType: "arraybuffer" });
+        const pdfBuffer = Buffer.from(response.data);
         const data = await pdf(pdfBuffer);
-        const totalChars = data.text.length;
+
         const CHUNK = 15000;
         const chunks = [];
-
         for (let i = 0; i < data.text.length; i += CHUNK) {
           chunks.push(data.text.slice(i, i + CHUNK));
         }
@@ -90,7 +71,7 @@ app.post("/webhook", async (req, res) => {
         userContext[from] = { chunks, totalPages: data.numpages };
 
         await sendMessage(from,
-          `✅ PDF processado com sucesso!\n📊 ${data.numpages} páginas divididas em ${chunks.length} partes.\n\nAgora pode fazer suas perguntas! 😊\n\nDigite *limpar* para enviar um novo PDF.`
+          `✅ PDF processado!\n📊 ${data.numpages} páginas em ${chunks.length} partes.\n\nAgora pode fazer suas perguntas! 😊\n\nDigite *limpar* para enviar um novo PDF.`
         );
       } catch (e) {
         await sendMessage(from, `❌ Erro ao processar PDF: ${e.message}`);
@@ -142,31 +123,13 @@ ${context}`,
   return msg.content[0].text;
 }
 
-// Envia mensagem pelo WhatsApp
+// Envia mensagem pela Z-API
 async function sendMessage(to, text) {
   await axios.post(
-    `https://graph.facebook.com/v19.0/${PHONE_ID}/messages`,
-    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" } }
+    `${ZAPI_URL}/send-text`,
+    { phone: to, message: text },
+    { headers: { "Content-Type": "application/json" } }
   );
-}
-
-// Obtém URL do arquivo de mídia
-async function getMediaUrl(mediaId) {
-  const res = await axios.get(
-    `https://graph.facebook.com/v19.0/${mediaId}`,
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
-  );
-  return res.data.url;
-}
-
-// Baixa o arquivo de mídia
-async function downloadMedia(url) {
-  const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-    responseType: "arraybuffer"
-  });
-  return Buffer.from(res.data);
 }
 
 const PORT = process.env.PORT || 3000;
